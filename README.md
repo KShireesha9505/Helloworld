@@ -1,302 +1,354 @@
-
-from typing import TypedDict
-from langgraph.graph import StateGraph, END, START
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_anthropic import ChatAnthropic
-from pydantic import BaseModel, Field
-from git import Repo
-from github import Github
+# github_agent.py
 import os
-import shutil
-from github.GithubException import GithubException
-from git import Repo, GitCommandError
-from langchain_google_genai import ChatGoogleGenerativeAI
-import google.generativeai as genai
-import datetime
-
-class CodeSolution(BaseModel):
-    """Schema for code solutions."""
-    description: str = Field(description="Description of the solution approach")
-    code: str = Field(description="Complete code including imports and docstring")
-
-class GraphState(TypedDict):
-    """State for the task processing workflow."""
-    status: str  # Using status instead of error to track state
-    task_content: str
-    repo_dir: str
-    generation: CodeSolution | None
-    iterations: int
-
-
-def clone_repository(github_token: str, repo_name: str) -> tuple[str, str]:
-    """Clone the repository and return the local directory."""
-    try:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        repo_dir = os.path.join(script_dir, 'agent-task')
-        
-        print(f"Target directory: {repo_dir}")
-
-        # Remove existing directory
-        if os.path.exists(repo_dir):
-            print("Removing existing directory...")
-            try:
-                shutil.rmtree(repo_dir, onerror=lambda func, path, exc_info: os.chmod(path, 0o777))
-            except Exception as e:
-                return "", f"Failed to clean directory: {str(e)}"
-
-        # Clone with authentication
-        try:
-            print(f"Cloning {repo_name}...")
-            # Use authenticated URL
-            auth_url = f"https://{github_token}@github.com/{repo_name}.git"
-            # print(auth_url)
-            Repo.clone_from(
-                url=auth_url,
-                to_path=repo_dir,
-                progress=print
-            )
-            return repo_dir, ""
-        except GitCommandError as e:
-            # print(e+"10")
-            return "", f"Git clone failed (code {e.status}): {str(e)}"
-        except Exception as e:
-            # print(e+"20")
-            return "", f"Clone error: {str(e)}"
-
-    except Exception as e:
-        # print(e+"30")
-        return "", f"Repository setup failed: {str(e)}"
-    
-def read_task_file(repo_dir: str) -> tuple[str, str]:
-    """Read the task markdown file."""
-    try:
-        task_path = os.path.join(repo_dir, 'tasks', 'task.md.txt')
-        print(f"Attempting to read task from: {task_path}")
-        
-        # Verify path exists
-        if not os.path.exists(task_path):
-            return "", f"Task file not found at: {task_path}"
-            
-        with open(task_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-            if not content.strip():
-                return "", "Task file is empty"
-            return content, ""
-    except Exception as e:
-        return "", f"Failed to read task: {str(e)}"
-
-def initialize_state(github_token: str, repo_name: str) -> dict:
-    """Initialize the workflow state."""
-    repo_dir, error = clone_repository(github_token, repo_name)
-    if error:
-        # print("t1")
-        return {
-            "status": "failed",
-            "task_content": "",
-            "repo_dir": "",
-            "generation": None,
-            "iterations": 0
-        }
-
-    task_content, error = read_task_file(repo_dir)
-    # print(task_content)
-    if error:
-        # print("hello")
-        return {
-            "status": "failed",
-            "task_content": "",
-            "repo_dir": repo_dir,
-            "generation": None,
-            "iterations": 0
-        }
-
-    return {
-        "status": "ready",
-        "task_content": task_content,
-        "repo_dir": repo_dir,
-        "generation": None,
-        "iterations": 0
-    }
-
-from langchain_google_genai import ChatGoogleGenerativeAI
-import google.generativeai as genai
-
-# Configure Gemini (add to your initialization code)
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-
-def generate_solution(state: GraphState):
-    """Generate code solution using Gemini"""
-    if state["status"] == "failed":
-        return state
-
-    task_content = state["task_content"]
-    iterations = state["iterations"]
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a Python developer. Generate a solution based on the task requirements.
-        Include complete code with imports, type hints, docstring, and examples.
-        The function must be named exactly 'calculate_products'."""),
-        ("human", "Task description:\n{task}"),
-    ])
-
-    try:
-        # Using Gemini Pro
-        llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0)
-        chain = prompt | llm.with_structured_output(CodeSolution)
-
-        print(f"\nGenerating solution - Attempt #{iterations + 1}")
-        solution = chain.invoke({"task": task_content})
-        
-        print(f"\nGenerated solution:\n{solution.code}")
-        return {
-            "status": "generated",
-            "task_content": task_content,
-            "repo_dir": state["repo_dir"],
-            "generation": solution,
-            "iterations": iterations + 1
-        }
-    except Exception as e:
-        print(f"Generation failed: {str(e)}")
-        return {**state, "status": "failed"}
-
-def test_solution(state: GraphState):
-    """Test the generated code solution."""
-    if state["status"] != "generated" or not state["generation"]:
-        return {**state, "status": "failed"}
-
-    try:
-        namespace = {}
-        exec(state["generation"].code, namespace)
-
-        result = namespace['calculate_products']([1, 2, 3, 4])
-        if result != [24, 12, 8, 6]:
-            return {**state, "status": "failed"}
-
-        return {**state, "status": "tested"}
-
-    except Exception:
-        return {**state, "status": "failed"}
-
-def create_pr(state: GraphState):
-    """Create a pull request with the solution."""
-    if state["status"] != "tested" or not state["generation"]:
-        return {**state, "status": "failed"}
-
-    try:
-        solution = state["generation"]
-        repo = Repo(state["repo_dir"])
-
-        # Local git operations
-        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        branch_name = f"solution/array-products-{timestamp}"
-        current = repo.create_head(branch_name)
-        current.checkout()
-
-        solution_path = os.path.join(state["repo_dir"], "array_products.py")
-        with open(solution_path, "w") as f:
-            f.write(solution.code)
-
-        repo.index.add(["array_products.py"])
-        repo.index.commit("feat: add array products calculator")
-        origin = repo.remote("origin")
-        origin.push(branch_name)
-
-        # Create PR using GitHub API
-        g = Github(os.getenv("GITHUB_TOKEN"))
-        repo_name = repo.remotes.origin.url.split('.git')[0].split('/')[-2:]
-        repo_name = '/'.join(repo_name)
-        gh_repo = g.get_repo(repo_name)
-
-        pr = gh_repo.create_pull(
-            title="Add Array Products Calculator",
-            body=f"Implements array products calculator with the following approach:\n\n{solution.description}",
-            base="main",
-            head=branch_name
-        )
-
-        print(f"Created PR: {pr.html_url}")
-        return {**state, "status": "completed", "pr_url": pr.html_url}
-
-    except Exception as e:
-        print(f"Failed to create PR: {str(e)}")
-        return {**state, "status": "failed"}
-
-def should_continue(state: GraphState) -> str:
-    """Determine next step based on status."""
-    if state["status"] == "failed":
-        if state["iterations"] < 3:
-            return "generate"
-        return "end"
-    return "continue"
-
-def create_agent(github_token: str, repo_name: str):
-    workflow = StateGraph(GraphState)
-    # print(github_token)
-    workflow.add_node("generate", generate_solution)
-    workflow.add_node("test", test_solution)
-    workflow.add_node("create_pr", create_pr)
-
-    # Define core workflow
-    workflow.add_edge(START, "generate")
-    workflow.add_edge("generate", "test")
-    workflow.add_edge("create_pr", END)
-
-    # Define conditional transitions from test node
-    workflow.add_conditional_edges(
-        "test", should_continue,
-        {"generate": "generate", "continue": "create_pr", "end": END}
-    )
-    return workflow.compile()
-
-def run_agent(github_token: str, repo_name: str):
-    """Run the agent to generate and submit a solution."""
-    try:
-        agent = create_agent(github_token, repo_name)
-        # print(agent)
-        initial_state = initialize_state(github_token, repo_name)
-
-        if initial_state["status"] == "failed":
-            print("Failed to initialize agent")
-            return {"status": "failed"}
-
-        result = agent.invoke(initial_state)
-        print(result)
-        if result["status"] == "completed":
-            print("Successfully created PR with solution!")
-        else:
-            print("Failed to create solution")
-
-        return {
-            "status": result["status"],
-            "generation": result["generation"].code if result["generation"] else None,
-            "pr_url": result.get("pr_url")
-        }
-
-    except Exception as e:
-        print("Agent execution failed")
-        return {"status": "failed"}
-
-import os
+import requests
+from typing import List, Dict, Optional
 from dotenv import load_dotenv
+from langchain_core.documents import Document
+
 load_dotenv()
 
+class GitHubIssueResolver:
+    def __init__(self):
+        self.headers = {
+            "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
+            "Accept": "application/vnd.github.v3+json" #"Hey, I want my response in the format you use for version 3 of your API, and I want it as JSON."
+        }
+        self.owner = "techwithtim"  # Default, can be overridden
+        self.repo = "Flask-Web-App-Tutorial"
 
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-# print(GITHUB_TOKEN)
-if not GITHUB_TOKEN:
-    raise ValueError("Please set GITHUB_TOKEN environment variable")
+    def _make_github_request(self, endpoint: str) -> Dict:
+        url = f"https://api.github.com/repos/{self.owner}/{self.repo}/{endpoint}"
+        response = requests.get(url, headers=self.headers)
+        # print("--------")
+        # print(response.json())
+        return response.json() if response.status_code == 200 else {}
 
-REPO_NAME = "KShireesha9505/agent-task"
-result = run_agent(GITHUB_TOKEN, REPO_NAME)
+    def find_similar_issues(self, issue_title: str) -> List[Dict]:
+        """Find issues with similar titles using GitHub search API"""
+        print("hello")
+        query = f"repo:{self.owner}/{self.repo} {issue_title} in:title state:all"
+        print(query)
+        search_url = f"https://api.github.com/search/issues?q={query}"
+        response = requests.get(search_url, headers=self.headers)
+        print(response.json())
+        return response.json().get("items", [])
 
-if result["status"] == "completed":
-    print("\nSolution generated successfully!")
-    if result.get("pr_url"):
-        print(f"\nPull Request created at: {result['pr_url']}")
-    if result.get("generation"):
-        print("\nGenerated Code:")
-        print(result["generation"])
-else:
-    print("\nFailed to generate solution")
+    def get_issue_state(self, issue_number: int) -> Dict:
+        """Get detailed issue state including timeline events"""
+        issue_data = self._make_github_request(f"issues/{issue_number}")
+        # print(issue_data)
+        # print("----")
+        timeline_data = self._make_github_request(f"issues/{issue_number}/timeline")
+        # print(timeline_data)
+        # print("-----------_____")
+        return {
+            "basic": issue_data,
+            "timeline": timeline_data,
+            "is_resolved": self._check_if_resolved(issue_data, timeline_data)
+        }
+
+    def _check_if_resolved(self, issue_data: Dict, timeline_data: List) -> bool:
+        """Determine if issue was properly resolved"""
+        if issue_data.get("state") != "closed":
+            return False
+        # if timeline_data.get("event") == "closed":
+        #     return True
+        
+        # Check for PRs that mention closing this issue
+        for event in timeline_data:
+            if event.get("event") == "cross-referenced":
+                source = event.get("source", {})
+                # print("-----------_____")
+                # print(source)
+                # print("-----------_____")
+                if "pull_request" in source.get("html_url", ""):
+                    if any(keyword in source.get("body", "").lower() 
+                          for keyword in ["closes", "fixes", "resolves"]):
+                        return True
+        return False
+
+    def contribute_to_issue(self, issue_number: int, comment: str) -> str:
+        """Add context to existing issue"""
+        print(issue_number)
+        print(f"https://api.github.com/repos/{self.owner}/{self.repo}/issues/{issue_number}/comments")
+        response = requests.post(
+            f"https://api.github.com/repos/{self.owner}/{self.repo}/issues/{issue_number}/comments",
+            headers=self.headers,
+            json={"body": comment}
+        )
+        print("Status Code:", response.status_code)
+        print("Response Text:", response.text)
+        return "Comment added successfully" if response.status_code == 201 else "Failed to add comment"
+
+    def handle_new_issue(self, title: str, body: str) -> Dict:
+        """Full workflow for issue handling"""
+        similar_issues = self.find_similar_issues(title)
+        
+        for issue in similar_issues:
+            issue_state = self.get_issue_state(issue["number"])
+            
+            # Case 1: Issue already resolved
+            if issue_state["is_resolved"]:
+                return {
+                    "action": "duplicate",
+                    "status": "resolved",
+                    "message": f"This appears to be a duplicate of #{issue['number']} which was already resolved",
+                    "reference": issue["html_url"]
+                }
+            
+            # Case 2: Open issue exists
+            return {
+                "action": "contribute",
+                "status": "open",
+                "message": self.contribute_to_issue(
+                    issue_number=issue["number"],
+                    comment=f"Additional context from similar report:\n\n**Title**: {title}\n**Description**: {body}"
+                ),
+                "reference": issue["html_url"]
+            }
+        
+        # Case 3: New issue
+        return {
+            "action": "new",
+            "status": "unresolved",
+            "message": "No similar issues found - this appears to be a new report"
+        }
+
+    def fetch_issues_as_documents(self) -> List[Document]:
+        """Fetch all issues as LangChain Documents for vector store"""
+        issues = self._make_github_request("issues?state=all")
+        docs = []
+        # print("__________________")
+       # print(issues[0])
+        for issue in issues:
+            
+            
+            metadata = {
+                "number": issue["number"],
+                "title": issue["title"],
+
+                "url": issue["html_url"],
+                "state": issue["state"],
+                "created_at": issue["created_at"]
+            }
+            content = f"Issue #{issue['number']}: {issue['title']}\nState: {issue['state']}\n"
+            content += f"Description:\n{issue['body']}\n" if issue.get("body") else ""
+            
+            docs.append(Document(page_content=content, metadata=metadata))
+            # print("----------------n")
+        # print(docs)
+        return docs
 
 
+
+
+
+from dotenv import load_dotenv
+import os
+from typing import List, Dict, Optional
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_astradb import AstraDBVectorStore
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain.tools.retriever import create_retriever_tool
+from langchain import hub
+from langchain_core.documents import Document
+from langchain.tools import tool
+from github2 import GitHubIssueResolver
+from note import note_tool
+
+load_dotenv()
+
+# New solution generation tool
+@tool
+
+def generate_solution(problem_description: str) -> str:
+    """Generates technical solutions for coding problems"""
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-1.5-pro",
+        google_api_key=os.getenv("GEMINI_API_KEY")  # Explicitly pass the key
+    )
+    prompt = f"""Provide a detailed solution for:
+    {problem_description}
+    
+    Include:
+    1. Root cause analysis
+    2. Fixes with code examples
+    3. Prevention tips"""
+    
+    return llm.invoke(prompt).content
+
+def initialize_vector_store() -> AstraDBVectorStore:
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return AstraDBVectorStore(
+        embedding=embeddings,
+        collection_name="github_issues",
+        api_endpoint=os.getenv("ASTRA_DB_API_ENDPOINT"),
+        token=os.getenv("ASTRA_DB_APPLICATION_TOKEN")
+    )
+
+
+
+def format_issue_response(issues: List[Document], resolution_context: Dict = None) -> str:
+    """Enhanced formatting with resolution status and solutions"""
+    response = ""
+    
+    if resolution_context:
+        response += f"RESOLUTION STATUS: {resolution_context.get('status', 'unknown').upper()}\n"
+        if resolution_context.get("reference"):
+            response += f"Reference: {resolution_context['reference']}\n\n"
+    
+    for i, issue in enumerate(issues, 1):
+        meta = issue.metadata
+        response += (
+            f"{i}. [{'OPEN' if meta.get('state') == 'open' else 'CLOSED'}] {meta.get('title', 'Untitled')}\n"
+            f"   #{meta.get('number')} | Created: {meta.get('created_at')}\n"
+            f"   URL: {meta.get('url')}\n"
+        )
+        
+        # Improved description extraction
+        if issue.page_content:
+            # Split into lines and find the Description line
+            lines = issue.page_content.split('\n')
+            desc_lines = []
+            found_desc = False
+            for line in lines:
+                if line.startswith("Description:"):
+                    found_desc = True
+                    continue
+                if found_desc and line.strip():
+                    desc_lines.append(line)
+            
+            description = ' '.join(desc_lines) if desc_lines else "No description"
+            response += f"   Description: {description[:200]}{'...' if len(description) > 200 else ''}\n"
+        
+        # Add solution if available in metadata
+        if meta.get('solution'):
+            response += f"   🔧 Solution Preview: {meta['solution'][:150]}...\n"
+        
+        response += "\n"
+    
+    return response
+# Initialize components
+resolver = GitHubIssueResolver()
+vstore = initialize_vector_store()
+
+# Update vector store with solutions if available
+if input("Update issues database? (y/N): ").lower() == "y":
+    issues = resolver.fetch_issues_as_documents()
+    try:
+        vstore.delete_collection()
+    except:
+        pass
+    vstore = initialize_vector_store()
+    
+    # Enhance issues with solutions from PRs/comments
+    enhanced_issues = []
+    for issue in issues:
+        # print(issue)
+        
+        issue_number = issue.metadata['number']
+        resolution_data = resolver.get_issue_state(issue_number)
+        # print("-------")
+        # print(resolution_data)
+        # print("-------")
+    
+        if resolution_data['is_resolved']:
+            # Try to extract solution from closing PR or comments
+            solution = f"Fixed in PR: {resolution_data.get('pr_url', 'N/A')}"
+            # print(resolution_data)
+            # print(solution)
+            
+            issue.metadata['solution'] = solution
+        enhanced_issues.append(issue)
+    
+    vstore.add_documents(enhanced_issues)
+    # print(f"Loaded {len(enhanced_issues)} issues")
+    print(f"Loaded issues")
+
+# Configure retriever
+retriever = vstore.as_retriever(
+    search_type="similarity",
+    search_kwargs={"k": 3}
+)
+
+retriever_tool = create_retriever_tool(
+    retriever,
+    name="github_issues",
+    description="Search for GitHub issues including solutions. Use before reporting new issues."
+)
+
+# Agent setup with solution-focused prompt
+llm = ChatGoogleGenerativeAI(
+    model="gemini-1.5-pro",
+    google_api_key=os.getenv("GEMINI_API_KEY")
+)
+
+tools = [retriever_tool, note_tool, generate_solution]  # Added solution tool
+
+prompt = hub.pull("hwchase17/react").partial(
+    instructions="""You are a technical support assistant. Follow these steps:
+1. First check for existing similar issues
+2. If found, show their solutions
+3. For new issues, analyze and provide:
+   - Root cause
+   - Step-by-step fix
+   - Code examples
+   - Prevention tips
+4. Format responses clearly with markdown"""
+)
+
+agent = create_react_agent(llm, tools, prompt)
+executor = AgentExecutor(
+    agent=agent,
+    tools=tools,
+    verbose=True,
+    handle_parsing_errors=True
+)
+
+# Main loop
+while True:
+    user_input = input("\nDescribe your GitHub issue (or 'q' to quit): ")
+    if user_input.lower() == 'q':
+        break
+    
+    # Check for existing issues
+    similar_docs = retriever.invoke(user_input)
+    # print(similar_docs)
+    
+    if similar_docs:
+        docs = []
+        similar_issues = []
+        
+        for doc in similar_docs:
+            metadata = doc.metadata
+            docs.append(doc)
+            similar_issues.append({
+                "number": metadata.get("number"),
+                "title": metadata.get("title"),
+                "html_url": metadata.get("url"),
+                "state": metadata.get("state"),
+                "body": doc.page_content,
+                "solution": metadata.get("solution", "")
+            })
+        
+        resolution_status = resolver.get_issue_state(similar_issues[0]["number"])
+        print("\n" + format_issue_response(docs, {
+            "status": "resolved" if resolution_status["is_resolved"] else "open",
+            "reference": similar_issues[0]["html_url"]
+        }))
+        
+        action = input("\nChoose action: [1] Comment on existing  [2] Continue as new: ")
+        if action == "1":
+            comment = input("Enter your comment: ")
+            print(resolver.contribute_to_issue(similar_issues[0]["number"], comment))
+            continue
+       
+    
+    # For new issues or when user chooses to proceed
+    print("\nAnalyzing your issue and generating solution...")
+    result = executor.invoke({
+        "input": f"Help solve this issue: {user_input}",
+        "existing_issues": format_issue_response(docs) if similar_docs else "No similar issues found"
+    })
+    print(result["output"])
